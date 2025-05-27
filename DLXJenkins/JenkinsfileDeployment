@@ -1,0 +1,243 @@
+def editMode = "EditMode"
+def playMode = "PlayMode"
+def generalUtil
+def unityUtil
+def mainBranches = ["main", "master"]
+
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'PR_BRANCH', defaultValue: '', description: '')
+        string(name: 'PR_DESTINATION_BRANCH', defaultValue: '', description: '')
+        string(name: 'PR_REPO_HTML', defaultValue: '', description: '')
+        string(name: 'PR_REPO_NAME', defaultValue: '', description: '')
+        string(name: 'PR_COMMIT', defaultValue: '', description: '')
+        string(name: 'PR_PROJECT', defaultValue: '', description: '')
+        string(name: 'PR_STATE', defaultValue: '', description: '')
+    }
+
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'PR_BRANCH', value: '$.pullrequest.source.branch.name'],
+                [key: 'PR_DESTINATION_BRANCH', value: '$.pullrequest.destination.branch.name'],
+                [key: 'PR_REPO_HTML', value: '$.repository.links.self.href'],
+                [key: 'PR_REPO_NAME', value: '$.repository.name'],
+                [key: 'PR_COMMIT', value: '$.pullrequest.source.commit.hash'],
+                [key: 'PR_PROJECT', value: '$.repository.full_name'],
+                [key: 'PR_STATE', value: '$.pullrequest.state']
+            ],
+
+            tokenCredentialId: 'trigger-token',
+            regexpFilterText: '$PR_STATE',
+            regexpFilterExpression: 'MERGED'
+        )
+    }
+
+    environment {
+        CI_PIPELINE = "false"
+        PROJECT_DIR = "${WORKSPACE}/Unity_Project"
+        REPORT_DIR = "${WORKSPACE}/DeploymentJob"
+        JOB_REPO = "${PR_REPO_HTML}"
+        BITBUCKET_ACCESS_TOKEN = credentials('bitbucket-access-token')
+        DESTINATION_BRANCH = "${PR_DESTINATION_BRANCH}"
+        DLX_PROJECT_LIST = env.DLX_LIST.split(',')
+    }
+
+    stages {
+        // Deletes the cloned branch from the build machine after it has been merged into main.
+        // This prevents the build machine's storage from capping out.
+        stage ('Delete Merged Branch') {
+            steps {
+                script {
+                    // Aborts the pipeline if it's not merging into the main.
+                    if(!mainBranches.contains(DESTINATION_BRANCH)){
+                        env.FAILURE_REASON = "Not merging to the main branch. Exiting the pipeline..."
+                        currentBuild.result = 'ABORTED'
+                        error(env.FAILURE_REASON)
+                    }
+
+                    generalUtil = load("${WORKSPACE}/groovy/generalHelper.groovy")
+                    unityUtil = load("${WORKSPACE}/groovy/unityHelper.groovy")
+
+                    generalUtil.cleanUpPRBranch(PR_BRANCH) 
+
+                    env.FOLDER_NAME = "${JOB_NAME}".split('/').first()
+                    def ticketNumber = generalUtil.parseTicketNumber(PR_BRANCH)
+                    generalUtil.cleanMergedBranchReportsFromWebServer(FOLDER_NAME, ticketNumber)
+                }
+            }
+        }
+        // Prepares the workspace for the build by cleaning the project, pulling main, and then telling Bitbucket that the
+        // build is in progress. It also checks to see if the project's Unity version is downloaded, and installs it if not.
+        stage ('Prepare Workspace') {
+            environment {
+                REPO_SSH = "git@bitbucket.org:${PR_PROJECT}.git"
+            }
+            steps {
+                script {
+                    // Getting the full commit hash from git in order to send the build status to Bitbucket.
+                    script {
+                        env.COMMIT_HASH = generalUtil.getFullCommitHash(WORKSPACE, PR_COMMIT)
+                        //env.COMMIT_HASH = "${sh (script: "git log -n 1 --pretty=format:\"%H\"", returnStdout: true)}"
+                    }
+
+                    if (!fileExists("${PROJECT_DIR}")) {
+                        echo "First time running pipeline. Cloning main branch..."
+                        sh "git clone ${REPO_SSH} \"${PROJECT_DIR}\""
+                    }
+                }
+                
+                script {
+                    // Clean the directory and checkout to main
+                    generalUtil.checkoutBranch(PROJECT_DIR, DESTINATION_BRANCH)
+                }
+                
+                script {
+                    echo "Sending \'In Progress\' status to Bitbucket..."
+                    generalUtil.sendBuildStatus(WORKSPACE, "INPROGRESS", COMMIT_HASH)
+
+                    echo "Identifying Unity version..."
+                    env.UNITY_EXECUTABLE = unityUtil.getUnityExecutable(WORKSPACE, PROJECT_DIR)
+                }
+
+                // Initial running the project on Unity Editor    
+                echo "Running Unity in batch mode to setup initial files..."
+                dir ("${PROJECT_DIR}") {
+                    script {
+                        def logFile = "${REPORT_DIR}/batchmode_results/batch_mode_execution.log"
+                        def flags = "-batchmode -nographics -projectPath \"${PROJECT_DIR}\" -executeMethod \"Packages.Rider.Editor.RiderScriptEditor.SyncSolution\" -logFile \"${logFile}\" -quit "
+                        
+                        echo "Flags set to: ${flags}"
+                        
+                        // Execute Unity in batch mode with memory settings
+                        def exitCode = sh(script: """\"${env.UNITY_EXECUTABLE}\" ${flags}""", returnStatus: true)
+                        
+                        // Handle exit code
+                        if (exitCode != 0) {
+                            sh "exit ${exitCode}"
+                        }    
+                    }
+                }
+            }
+        }
+        //linting stage to check formatting
+        stage('Linting')
+        {
+            steps{
+                //Linting
+                dir ("${REPORT_DIR}") {
+                    sh "mkdir -p linting_results"
+                }
+                echo "running lint script"
+                script {
+                    echo "Parameters for bash: ${WORKSPACE}/Linting.bash ${PROJECT_DIR} ${REPORT_DIR}"
+                    def exitCode = sh script: "sh \'${WORKSPACE}/Bash/Linting.bash\' \'${PROJECT_DIR}\' \'${REPORT_DIR}/linting_results\'", returnStatus: true 
+                    echo "After bash call, exit code: ${exitCode}"
+                    //handle exit code here no reports to be sent, since this for deployment and not PRs
+                    if(exitCode != 0)
+                    {
+                        //in this case we set build result to failure since we don't want to deploy bad code
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE'){
+                            error("Linting failed with exit code: ${exitCode}") //we exit no matter what on error code != 0
+                        }
+                    }
+                }
+            }
+        }
+        // Runs the project's EditMode tests. Unlike the PR pipeline, if any tests fail, this will cause the pipeline to fail.
+        // We do not want failing tests on main. 
+        stage ('EditMode Tests') {
+            steps {
+                dir ("${REPORT_DIR}") {
+                    sh "mkdir -p test_results"
+                }
+                echo "Running EditMode tests..."
+                dir ("${PROJECT_DIR}") {
+                    script {
+                        unityUtil.runUnityTests(UNITY_EXECUTABLE, REPORT_DIR, PROJECT_DIR, editMode, false, true)
+                    }
+                }
+            }
+        }
+        // Runs the project's PlayMode tests. Unlike the PR pipeline, if any tests fail, this will cause the pipeline to fail.
+        // We do not want failing tests on main. This stage is retried 5 times in case of Unity crashes (which are common).
+        stage ('PlayMode Tests In Editor'){
+            steps {
+
+                echo "Running PlayMode tests..."
+                dir ("${PROJECT_DIR}") {
+                    retry (5) {
+                        script {
+                            unityUtil.runUnityTests(UNITY_EXECUTABLE, REPORT_DIR, PROJECT_DIR, playMode, false, true)
+                        }
+                    }
+                }
+            }
+        }
+        // Builds the project for WebGL.
+        stage ('Build Project') {
+            steps {
+                echo "Building Unity project for WebGL..."
+                sh "mkdir -p \"${PROJECT_DIR}/Assets/Editor/\"" //The following line assumed this folder exists in every project, adding check to ensure it does.
+                sh "mv Builder.cs \"${PROJECT_DIR}/Assets/Editor/\""
+
+                retry (5) {
+                    script {
+                        unityUtil.buildProject(REPORT_DIR, PROJECT_DIR, UNITY_EXECUTABLE)
+                    }
+                }
+            }
+        }
+        // Deploys the build on our remote web server. 
+        stage ('Deploy Build') {
+            steps {
+                echo "Deploying build to LTI web server..."
+
+                script {
+                    sh "ssh vconadmin@dlx-webhost.canadacentral.cloudapp.azure.com \"sudo mkdir -p /var/www/html/${FOLDER_NAME} \
+                    && sudo chown vconadmin:vconadmin /var/www/html/${FOLDER_NAME}\""
+                    sh "scp -i C:/Users/ci-catherine/.ssh/vconkey1.pem -rp \"${PROJECT_DIR}/Builds/*\" \"vconadmin@dlx-webhost.canadacentral.cloudapp.azure.com:/var/www/html/${FOLDER_NAME}\""
+                    //call script to copy that into the deployed server
+                    sh "ssh vconadmin@dlx-webhost.canadacentral.cloudapp.azure.com 'bash ~/ShellScripts/UpdateBuildURL.sh /var/www/html/${FOLDER_NAME}'"
+                }
+                
+                script {
+                    if (DLX_PROJECT_LIST.contains(PR_REPO_NAME)) {
+                        echo "Deploying build to eConestoga dlx web server..."
+                        echo "List of DLX Repositories: ${DLX_PROJECT_LIST}"
+                        
+                        // Create the directory and update the file permission
+                        sh script: "ssh -i C:/Users/ci-catherine/.ssh/vconkey.pem vconadmin@dlx-econestoga.canadacentral.cloudapp.azure.com \"sudo mkdir -p /var/www/html/${FOLDER_NAME} && sudo chown vconadmin:vconadmin /var/www/html/${FOLDER_NAME}\""
+                        // Secured copy all WebGL components to the econestoga dlx server
+                        sh script: "scp -i C:/Users/ci-catherine/.ssh/vconkey.pem -rp \"${PROJECT_DIR}/Builds/*\" \"vconadmin@dlx-econestoga.canadacentral.cloudapp.azure.com:/var/www/html/${FOLDER_NAME}\""
+                        //call script to update the WebGL "index.html"
+                        sh script: "ssh vconadmin@dlx-econestoga.canadacentral.cloudapp.azure.com 'bash ~/ShellScripts/UpdateBuildURL.sh /var/www/html/${FOLDER_NAME}'"
+                        
+                    }
+                }
+            }
+        }
+    }
+
+    // Sends the build status to Bitbucket. If the build was successful, Bitbucket will link to the deployed project on the web server.
+    post {
+        success {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "SUCCESSFUL", COMMIT_HASH, true)
+            }
+        }
+        failure {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "FAILED", COMMIT_HASH, true)
+            }
+        }
+        aborted {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "STOPPED", COMMIT_HASH, true)
+            }
+        }
+    }
+}

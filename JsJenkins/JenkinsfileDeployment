@@ -1,0 +1,292 @@
+def generalUtil
+def jsUtil
+def mainBranches = ["main", "master"]
+
+pipeline {
+    agent any
+
+    tools {nodejs 'Node'}
+
+    parameters {
+        string(name: 'PR_BRANCH', defaultValue: '', description: '')
+        string(name: 'PR_DESTINATION_BRANCH', defaultValue: '', description: '')
+        string(name: 'PR_REPO_HTML', defaultValue: '', description: '')
+        string(name: 'PR_COMMIT', defaultValue: '', description: '')
+        string(name: 'PR_PROJECT', defaultValue: '', description: '')
+        string(name: 'PR_STATE', defaultValue: '', description: '')
+    }
+
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'PR_BRANCH', value: '$.pullrequest.source.branch.name'],
+                [key: 'PR_DESTINATION_BRANCH', value: '$.pullrequest.destination.branch.name'],
+                [key: 'PR_REPO_HTML', value: '$.repository.links.self.href'],
+                [key: 'PR_COMMIT', value: '$.pullrequest.source.commit.hash'],
+                [key: 'PR_PROJECT', value: '$.repository.full_name'],
+                [key: 'PR_STATE', value: '$.pullrequest.state']
+            ],
+
+            tokenCredentialId: 'trigger-token',
+            regexpFilterText: '$PR_STATE',
+            regexpFilterExpression: 'MERGED'
+        )
+    }
+
+    environment {
+        CI_PIPELINE = "false"
+        PROJECT_DIR = "${WORKSPACE}/JS_Project"
+        REPORT_DIR = "${WORKSPACE}/DeploymentJob"
+        JOB_REPO = "${PR_REPO_HTML}"
+        BITBUCKET_ACCESS_TOKEN = credentials('bitbucket-access-token')
+        DESTINATION_BRANCH = "${PR_DESTINATION_BRANCH}"
+
+        // Environmental variables for static analysis
+        SONARQUBE_SERVER="SonarServer"
+        SONARQUBE_SCANNER="sonarqube-scanner"
+        SONAR_PROJECT_KEY="${env.JOB_NAME.split('/')[0]}-Deployment"
+        SONAR_AUTH_TOKEN="squ_8f0b6b1b3cfd5f621b1ff21a836a569ee9d4cf75"
+    }
+
+    stages {
+        // Deletes the cloned branch from the build machine after it has been merged into main.
+        // This prevents the build machine's storage from capping out.
+        stage ('Delete Merged Branch') {
+            steps {
+                script {
+                    // Aborts the pipeline if it's not merging into the main.
+                    if(!mainBranches.contains(DESTINATION_BRANCH)){
+                        env.FAILURE_REASON = "Not merging to the main branch. Exiting the pipeline..."
+                        currentBuild.result = 'ABORTED'
+                        error(env.FAILURE_REASON)
+                    }
+
+                    generalUtil = load("${WORKSPACE}/groovy/generalHelper.groovy")
+                    jsUtil = load("${WORKSPACE}/groovy/jsHelper.groovy")
+                    
+                    def branch_path = sh (script: "/usr/bin/find ../ -type d -name \"${PR_BRANCH}\"", returnStdout: true)
+                    branch_path = branch_path.trim()
+                    if(!branch_path.isEmpty()){
+                        sh "rm -r -f \"${branch_path}\""
+                        sh "rm -r -f \"${branch_path}@tmp\""
+                    }
+
+                    env.FOLDER_NAME = "${JOB_NAME}".split('/').first()
+                    def ticketNumber = generalUtil.parseTicketNumber(PR_BRANCH)
+                    generalUtil.cleanMergedBranchReportsFromWebServer(FOLDER_NAME, ticketNumber)
+                }
+            }
+        }
+        // Prepares the workspace for the build by cleaning the project, pulling main, and then telling Bitbucket that the
+        // build is in progress. It also checks to see if the project's Unity version is downloaded, and installs it if not.
+        stage ('Prepare Workspace') {
+            environment {
+                REPO_SSH = "git@bitbucket.org:${PR_PROJECT}.git"
+            }
+            steps {
+                script {
+                    // Getting the full commit hash from git in order to send the build status to Bitbucket.
+                    script {
+                        env.COMMIT_HASH = generalUtil.getFullCommitHash(WORKSPACE, PR_COMMIT)
+                        //env.COMMIT_HASH = "${sh (script: "git log -n 1 --pretty=format:\"%H\"", returnStdout: true)}"
+                    }
+                    if (!fileExists("${PROJECT_DIR}")) {
+                        echo "First time running pipeline. Cloning main branch..."
+                        sh "git clone ${REPO_SSH} \"${PROJECT_DIR}\""
+                    }
+                }
+                
+                dir ("${PROJECT_DIR}") {
+                    // Ensure it stays in the main branch
+                    echo "Checkout to the main branch..."
+                    sh "git checkout ${DESTINATION_BRANCH}"
+                    echo "Cleaning project..."
+                    sh "git reset --hard HEAD"
+                    echo "Pulling latest version of default branch..."
+                    sh "git pull"
+                }
+
+                script {
+                    echo "Sending \'In Progress\' status to Bitbucket..."
+                    generalUtil.sendBuildStatus(WORKSPACE, "INPROGRESS", COMMIT_HASH)
+                    env.TEST_DIRECTORIES = jsUtil.findTestingDirs(PROJECT_DIR)
+                    echo "Testing directories: ${env.TEST_DIRECTORIES}"
+                }
+            }
+        }
+        stage('Install Dependencies'){
+            steps {
+                script {    
+                    //MUST USE BAT for npm commands, otherwise jenkins tries to use WSL for a linux distro                
+                    echo "Dependencies step"
+                    echo "Check NPM"
+
+                    bat 'node -v'
+                    bat 'npm -v'
+                    bat 'npm config ls'
+
+                    echo 'Install dependencies in testing directories'
+                    jsUtil.installNpmInTestingDirs(env.TEST_DIRECTORIES)
+
+                    // Change back to default directory
+                    bat(script: 'cd "' + WORKSPACE + '"') 
+                }
+            }
+        }
+        //linting stage to check formatting
+        stage('Linting')
+        {
+            steps{
+                dir ("${REPORT_DIR}") {
+                    sh "mkdir -p linting_results"
+                }
+                script {
+                    echo "Linting step"
+                    jsUtil.executeLintingInTestingDirs(env.TEST_DIRECTORIES, false) //* Set the deploymentBuild argument as "false" for now 
+                }
+            }
+        }
+        // Runs the project's EditMode tests, and then generates a test report and a code coverage report.
+        // Sends the test results to Bitbucket once the tests complete.
+        stage('Unit Testing') {
+            steps {
+                script {
+                    echo "Unit testing step"
+                    echo 'Run unit testing in testing directories'
+                    jsUtil.runUnitTestsInTestingDirs(env.TEST_DIRECTORIES, false) //* Set the deploymentBuild argument as "false" for now 
+
+                    // Change back to default directory
+                    bat(script: 'cd "' + WORKSPACE + '"') 
+                }
+            }
+        }
+         // Runs static code analysis using SonarQube installed in Jenkins virtual machine. 
+        stage('Static Analysis'){
+            steps {
+                dir ("${PROJECT_DIR}") {
+                    script {
+                        def scannerHome = tool "sonarqube-scanner"
+                        withSonarQubeEnv(SONARQUBE_SERVER) {
+                            bat "${scannerHome}\\bin\\sonar-scanner.bat " +
+                            "-Dsonar.projectKey=${SONAR_PROJECT_KEY} " +
+                            "-Dsonar.sources=. " +
+                            "-Dsonar.login=${SONAR_AUTH_TOKEN}"
+                        }
+                    }
+                }
+                script{
+                    timeout(time: 1, unit: 'HOURS') {
+                        // Abort the pipeline for deployment
+                        waitForQualityGate abortPipeline: true
+                    }
+                }
+            }
+        }
+        // Builds the project if needed (containerization?)
+        stage ('Build Project') {
+            steps {
+                script {
+                    echo "Build step"
+                }
+            }
+        }
+        // Deploys the build on our remote web server. 
+        stage ('Deploy Build') {
+            steps {
+                script {   
+
+                    // Check whether the Docker is running or not
+                    def isDockerRunning = sh(script: "docker info > /dev/null 2>&1", returnStatus: true)
+                    if (isDockerRunning != 0) {
+                        echo "Docker is not running or not available."
+                        error("Docker is not available. Please start Docker and try again.")
+                    }
+
+                    /*
+                    >> Uncommented when the vConestoga team's version control strategy is solid          <<
+                    >> All the tags should be updated latest to server_version or client_version as well <<
+
+                    // Read container's version number from each server and client package.json
+                    echo "Get the version of each container image"
+                    def server_version = ""
+                    def client_version = ""
+
+                    dir("${PROJECT_DIR}/server") {
+                        // Read the version value of package.json using Node.js.
+                        server_version = sh(
+                            script: "node -p \"require('./package.json').version\"",
+                            returnStdout: true
+                        ).trim()                              
+                         echo "Server Container Version: ${server_version}"
+                    }
+
+                    dir("${PROJECT_DIR}/client-portual") {
+                        // Read the version value of package.json using Node.js.
+                        client_version = sh(
+                            script: "node -p \"require('./package.json').version\"",
+                            returnStdout: true
+                        ).trim()
+                        echo "Client Container Version: ${client_version}"
+                    }
+                    */
+
+                    // Login to Azure using system managed identity
+                    powershell "az login --identity --username 1e9035e2-9e91-4d9c-8fdb-6d70ac50e119"
+                    
+                    // Login to Azure Container Registry
+                    powershell "az acr login --name webbuilds"
+
+                    def serverPath = env.PROJECT_DIR.replace('\\', '/')
+                    // Build server & client container image
+                    echo "Build The Server Container Image"
+                    sh "docker build -t webbuilds.azurecr.io/assetstore-server:latest ${serverPath}/server/."
+
+                    echo "Build The Client Container Image"
+                    sh "docker build -t webbuilds.azurecr.io/assetstore-client:latest ${serverPath}/client-portual/."  
+
+
+                    // Push each container to the Azure Container Registry
+                    echo "Push The Server Container Image to Azure Container Registry"
+                    sh "docker push webbuilds.azurecr.io/assetstore-server:latest"
+
+                    echo "Push The Client Container Image to Azure Container Registry"
+                    sh "docker push webbuilds.azurecr.io/assetstore-client:latest"  
+
+
+                    // Update each instance from Azure Container App 
+                    echo "Upupdate The Server Container App to the Latest Version"
+                    powershell "az containerapp update --name assetstore-server --resource-group AssetStore --image webbuilds.azurecr.io/assetstore-server:latest"      
+
+                    //echo "Upupdate The Client Container App to the Latest Version"
+                    powershell "az containerapp update --name assetstore-client --resource-group AssetStore --image webbuilds.azurecr.io/assetstore-client:latest"  
+
+
+                    // Clean up local images
+                    echo "Delete The Server & Client Container Image from dlx-webhost Server"
+                    sh "docker rmi webbuilds.azurecr.io/assetstore-server:latest"
+                    sh "docker rmi webbuilds.azurecr.io/assetstore-client:latest"
+                      
+                }
+            }
+        }
+    }
+
+    // Sends the build status to Bitbucket. If the build was successful, Bitbucket will link to the deployed project on the web server.
+    post {
+        success {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "SUCCESSFUL", COMMIT_HASH, true, true)
+            }
+        }
+        failure {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "FAILED", COMMIT_HASH, true, true)
+            }
+        }
+        aborted {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "STOPPED", COMMIT_HASH, true, true)
+            }
+        }
+    }
+}

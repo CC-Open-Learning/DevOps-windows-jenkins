@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en-US">
+    <head>
+        <meta charset="utf-8"/>
+        <title>{{ ticket }} Logs</title>
+        <link rel="stylesheet" href="../../../css/logs.css"/>
+    </head>
+    <body>
+        <h3>{{ ticket }} Logs</h3>
+        <div id="nav" role="tablist" aria-label="Pipeline Logs">
+            <button role="tab" aria-selected="true" id="jenkins">Jenkins Logs</button>
+            <button role="tab" aria-selected="false" id="editmode">EditMode Test Logs</button>
+            <button role="tab" aria-selected="false" id="playmode">PlayMode Test Logs</button>
+            <button role="tab" aria-selected="false" id="build">Unity Build Logs</button>
+        </div>
+
+        <div role="tabpanel" aria-labelledby="jenkins" class="content">
+            {% for line in jenkins %}
+                {{ line }}<br>
+            {% endfor %}
+        </div>
+        <div role="tabpanel" aria-labelledby="editmode" class="content" hidden>
+            {% for line in editMode %}
+                {{ line }}<br>
+            {% endfor %}
+        </div>
+        <div role="tabpanel" aria-labelledby="playmode" class="content" hidden>
+            {% for line in playMode %}
+                {{ line }}<br>
+            {% endfor %}
+        </div>
+        <div role="tabpanel" aria-labelledby="build" class="content" hidden>
+            {% for line in build %}
+                {{ line }}<br>
+            {% endfor %}
+        </div>
+        
+        <script src="../../../js/logs.js"></script>
+    </body>
+</html>

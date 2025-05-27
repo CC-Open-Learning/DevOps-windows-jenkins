@@ -1,0 +1,193 @@
+def pass = "Pass"
+def fail = "Fail"
+def generalUtil
+def jsUtil
+
+pipeline {
+    agent any
+
+    tools {
+        nodejs 'Node'
+    }
+
+    parameters {
+        string(name: 'PR_BRANCH', defaultValue: '', description: '')
+        string(name: 'PR_DESTINATION_BRANCH', defaultValue: '', description: '')
+        string(name: 'PR_REPO_HTML', defaultValue: '', description: '')
+        string(name: 'PR_REPO_NAME', defaultValue: '', description: '')
+        string(name: 'PR_COMMIT', defaultValue: '', description: '')
+        string(name: 'PR_PROJECT', defaultValue: '', description: '')
+        string(name: 'PR_STATE', defaultValue: '', description: '')
+        string(name: 'TEST_RUN', defaultValue: '', description: 'This is a test run trigger. Fill in the parameter form with \'Y\' to run the pipeline without commit changes.')
+    }
+
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'PR_BRANCH', value: '$.pullrequest.source.branch.name'],
+                [key: 'PR_DESTINATION_BRANCH', value: '$.pullrequest.destination.branch.name'],
+                [key: 'PR_REPO_HTML', value: '$.repository.links.self.href'],
+                [key: 'PR_REPO_NAME', value: '$.repository.name'],
+                [key: 'PR_COMMIT', value: '$.pullrequest.source.commit.hash'],
+                [key: 'PR_PROJECT', value: '$.repository.full_name'],
+                [key: 'PR_STATE', value: '$.pullrequest.state']
+            ],
+
+            tokenCredentialId: 'trigger-token',
+            regexpFilterText: '$PR_STATE',
+            regexpFilterExpression: 'OPEN'
+        )
+    }
+
+    environment {
+        CI_PIPELINE = "true"
+        PROJECT_DIR = "${WORKSPACE}\\JS_Project" 
+        REPORT_DIR = "${WORKSPACE}/PRJob/${PR_BRANCH}/Build_${BUILD_NUMBER}"
+        JOB_REPO = "${PR_REPO_HTML}"
+        BITBUCKET_ACCESS_TOKEN = credentials('bitbucket-access-token')
+        JENKINS_API_KEY = credentials('jenkins-api-key')
+        REPO_SSH = "git@bitbucket.org:${PR_PROJECT}.git"
+        DESTINATION_BRANCH = "${PR_DESTINATION_BRANCH}"
+
+        // Environmental variables for static analysis
+        SONARQUBE_SERVER="SonarServer"
+        SONARQUBE_SCANNER="sonarqube-scanner"
+        SONAR_PROJECT_KEY="${env.JOB_NAME.split('/')[0]}-PR"
+        SONAR_AUTH_TOKEN="squ_8f0b6b1b3cfd5f621b1ff21a836a569ee9d4cf75"
+    }
+
+    stages {
+        // Prepare Workspace: Environment Setup, Workspace Preparation(Branch Management), Unity Setup, Initial running the project on Unity Editor
+        stage('Prepare Workspace') {
+            steps {
+                dir ("${PROJECT_DIR}") {
+                //send 'In Progress' status to Bitbucket
+                script {
+                    // print jenkins env configurations
+                    sh 'env'
+                    generalUtil = load("${WORKSPACE}/groovy/generalHelper.groovy")
+                    jsUtil = load("${WORKSPACE}/groovy/jsHelper.groovy")
+                    echo "validating commit hashes"
+                    env.COMMIT_HASH = generalUtil.validateCommitHashes(WORKSPACE, PROJECT_DIR, PR_COMMIT, TEST_RUN)
+                    echo env.COMMIT_HASH
+
+                    echo "initialize environment"
+                    generalUtil.initializeEnvironment(WORKSPACE, env.COMMIT_HASH, PR_BRANCH, PROJECT_DIR)
+
+                    echo "clone Or Update Repo"
+                    generalUtil.cloneOrUpdateRepo(PROJECT_DIR, REPO_SSH, PR_BRANCH)
+
+                    echo "merge Branch If Needed"
+                    generalUtil.mergeBranchIfNeeded()
+
+                    // Save directories pipeline is going to test. unique to JS pipeline
+                    echo "find Testing Dirs"
+                    env.TEST_DIRECTORIES = jsUtil.findTestingDirs(PROJECT_DIR)
+                    echo "Testing directories: ${env.TEST_DIRECTORIES}"
+                    } 
+                }
+            }
+        }
+        stage('Install Dependencies'){
+            steps {
+                script {    
+                    //MUST USE BAT for npm commands, otherwise jenkins tries to use WSL for a linux distro                
+                    echo "Dependencies step"
+                    echo "Check NPM"
+
+                    jsUtil.checkNodeVersion()
+
+                    echo 'Install dependencies in testing directories'
+                    jsUtil.installNpmInTestingDirs(env.TEST_DIRECTORIES)
+
+                    // Change back to default directory
+                    bat(script: 'cd "' + WORKSPACE + '"') 
+                }
+            }
+        }
+        stage('Linting'){
+            steps {
+                dir ("${REPORT_DIR}") {
+                    sh "mkdir -p linting_results"
+                }
+                script {
+                    echo "Linting step"
+                    jsUtil.executeLintingInTestingDirs(env.TEST_DIRECTORIES, false)
+                }
+            }
+        }
+        // Runs the project's EditMode tests, and then generates a test report and a code coverage report.
+        // Sends the test results to Bitbucket once the tests complete.
+        stage('Unit Testing') {
+            steps {
+                script {
+                    echo "Unit testing step"
+                    echo 'Run unit testing in testing directories'
+                    jsUtil.runUnitTestsInTestingDirs(env.TEST_DIRECTORIES, false)
+
+                    // Change back to default directory
+                    bat(script: 'cd "' + WORKSPACE + '"') 
+                }
+            }
+        }
+        // Runs static code analysis using SonarQube installed in Jenkins virtual machine. 
+        stage('Static Analysis'){
+            steps {
+                dir ("${PROJECT_DIR}") {
+                    script {
+                        sh "pwd"
+                        def scannerHome = tool "sonarqube-scanner"
+                        withSonarQubeEnv(SONARQUBE_SERVER) {
+                            bat "${scannerHome}\\bin\\sonar-scanner.bat " +
+                            "-Dsonar.projectKey=${SONAR_PROJECT_KEY} " +
+                            "-Dsonar.sources=. " +
+                            "-Dsonar.login=${SONAR_AUTH_TOKEN} "
+                        }
+                    }
+                }
+                script{
+                    timeout(time: 1, unit: 'HOURS') {
+                        // Parameter indicates whether to set pipeline to UNSTABLE if Quality Gate fails
+
+                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE'){
+                            def qualityGate = waitForQualityGate()
+                            if(qualityGate.status != "OK"){
+                                error "SonarQube Quality Gate failed"
+                            }                            
+                        }
+                    }
+                }
+            }
+        }
+        //Builds the project and saves it. containerization?
+        stage('Build Project') {
+            steps {
+                script {
+                    echo "Build Step"
+
+                    echo "Returning to the main branch..."
+                    generalUtil.checkoutBranch(PROJECT_DIR, DESTINATION_BRANCH);
+                }
+            }
+        }
+    }
+
+    // When the pipeline finishes, sends the build status to Bitbucket.
+    post {
+        success {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "SUCCESSFUL", COMMIT_HASH, false, true)
+            }
+        }
+        failure {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "FAILED", COMMIT_HASH, false, true)
+            }
+        }
+        aborted {
+            script {
+                generalUtil.sendBuildStatus(WORKSPACE, "STOPPED", COMMIT_HASH, false, true)
+            }
+        }
+    }
+}

@@ -1,0 +1,5 @@
+error CS0234
+An error occurred while resolving packages
+Native Crash
+Error building Player
+Build Finished, Result: Failure.
